@@ -454,6 +454,13 @@ extension Treatments {
             } message: {
                 Text("\(state.determinationFailureMessage)")
             }
+            // Presented as a fullScreenCover (NOT a third .sheet) — stacking multiple .sheet
+            // modifiers on one view makes the extra ones silently fail to present. A
+            // fullScreenCover is a separate presentation channel, so it reliably appears.
+            .fullScreenCover(isPresented: $state.showBolusPasswordPrompt) {
+                BolusPasswordPromptView(state: state)
+                    .interactiveDismissDisabled()
+            }
         }
 
         var progressText: ProgressText {
@@ -718,6 +725,52 @@ extension Treatments {
                 .frame(height: 1)
                 .foregroundColor(.gray.opacity(0.65))
                 .padding(.vertical)
+        }
+    }
+
+    /// Gate 2 prompt: requires the parent-set bolus password before a manual pump bolus is enacted.
+    /// Presented only when a password is configured; submitting drives `state.confirmBolusWithPassword()`
+    /// and cancelling drives `state.cancelBolusPassword()` (which aborts without bolusing).
+    struct BolusPasswordPromptView: View {
+        @Bindable var state: Treatments.StateModel
+        @FocusState private var passwordFieldFocused: Bool
+
+        var body: some View {
+            NavigationView {
+                Form {
+                    Section {
+                        SecureField(String(localized: "Password"), text: $state.bolusPasswordEntry)
+                            .textContentType(.oneTimeCode)
+                            .autocorrectionDisabled()
+                            .focused($passwordFieldFocused)
+                            .submitLabel(.go)
+                            .onSubmit { submit() }
+                    } header: {
+                        Text("Enter Bolus Password")
+                    } footer: {
+                        if !state.bolusPasswordError.isEmpty {
+                            Text(state.bolusPasswordError).foregroundColor(.red)
+                        }
+                    }
+                }
+                .navigationTitle("Bolus Password")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { state.cancelBolusPassword() }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Confirm") { submit() }
+                            .disabled(state.bolusPasswordEntry.isEmpty)
+                    }
+                }
+                .onAppear { passwordFieldFocused = true }
+            }
+        }
+
+        private func submit() {
+            guard !state.bolusPasswordEntry.isEmpty else { return }
+            Task { await state.confirmBolusWithPassword() }
         }
     }
 }

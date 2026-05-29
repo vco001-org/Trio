@@ -10,6 +10,7 @@ import Swinject
 extension Treatments {
     @Observable final class StateModel: BaseStateModel<Provider> {
         @ObservationIgnored @Injected() var unlockmanager: UnlockManager!
+        @ObservationIgnored @Injected() var bolusPasswordManager: BolusPasswordManager!
         @ObservationIgnored @Injected() var apsManager: APSManager!
         @ObservationIgnored @Injected() var broadcaster: Broadcaster!
         @ObservationIgnored @Injected() var pumpHistoryStorage: PumpHistoryStorage!
@@ -130,6 +131,17 @@ extension Treatments {
 
         var showDeterminationFailureAlert = false
         var determinationFailureMessage = ""
+
+        // MARK: - Bolus password gate (Gate 2)
+
+        /// Drives the SwiftUI password prompt presented before a manual pump bolus when a bolus
+        /// password is configured. These are inert (and the prompt never shows) when no password
+        /// is set, so the no-password flow is completely unchanged.
+        var showBolusPasswordPrompt = false
+        var bolusPasswordEntry = ""
+        var bolusPasswordError = ""
+        /// The manual pump-bolus amount captured when the prompt was raised, re-used on confirm.
+        private var pendingBolusAmount: Decimal = 0
 
         // Queue for handling Core Data change notifications
         private let queue = DispatchQueue(label: "TreatmentsStateModel.queue", qos: .userInitiated)
@@ -442,7 +454,14 @@ extension Treatments {
                 }
 
                 if isInsulinGiven {
-                    await handleInsulin(isExternal: externalInsulin)
+                    // GATE 2: if the gate terminally handled the flow (password prompt raised, OR locked
+                    // out), STOP here — don't run the post-enact UI handling below (loading animation /
+                    // stale-glucose alert / hideModal). The prompt case resumes via confirmBolusWithPassword();
+                    // the lockout case is owned by showLockoutAlert().
+                    let gateHandled = await handleInsulin(isExternal: externalInsulin)
+                    if gateHandled {
+                        return
+                    }
                 } else {
                     hideModal()
                     return
@@ -467,13 +486,16 @@ extension Treatments {
 
         // MARK: - Insulin
 
-        private func handleInsulin(isExternal: Bool) async {
+        /// Returns `true` if the Gate-2 path terminally handled the flow (password prompt raised, or
+        /// locked out) and the caller must NOT run the post-enact UI handling.
+        private func handleInsulin(isExternal: Bool) async -> Bool {
             debug(.bolusState, "handleInsulin fired")
 
             if !isExternal {
-                await addPumpInsulin()
+                return await addPumpInsulin()
             } else {
                 await addExternalInsulin()
+                return false
             }
         }
 
@@ -562,10 +584,30 @@ extension Treatments {
             }
         }
 
-        func addPumpInsulin() async {
+        func addPumpInsulin() async -> Bool {
             guard amount > 0 else {
                 showModal(for: nil)
-                return
+                return false
+            }
+
+            // GATE 2: If a bolus password is configured, require it (via the SwiftUI prompt)
+            // before enacting a manual pump bolus. When NO password is set, behavior is exactly
+            // unchanged: we fall through to the original biometric `unlock()` flow below.
+            if bolusPasswordManager.isBolusPasswordSet {
+                // Durable lockout: while locked, block the bolus and surface the remaining time.
+                if bolusPasswordManager.isLockedOut {
+                    await showLockoutAlert()
+                    return true
+                }
+
+                await MainActor.run {
+                    self.pendingBolusAmount = self.amount
+                    self.bolusPasswordEntry = ""
+                    self.bolusPasswordError = ""
+                    self.showBolusPasswordPrompt = true
+                }
+                // Do not bolus here. Continuation happens in `confirmBolusWithPassword()`.
+                return true
             }
 
             let maxAmount = Double(min(amount, maxBolus))
@@ -588,6 +630,72 @@ extension Treatments {
                     self.determinationFailureMessage = parseAuthenticationError(from: error)
                 }
             }
+            return false
+        }
+
+        // MARK: - Bolus password gate continuation
+
+        /// Called when the user submits the bolus-password prompt. On a correct password we enact the
+        /// manual pump bolus exactly as the legacy path does (same `isAwaitingDeterminationResult`
+        /// handling and `apsManager.enactBolus(... isSMB: false ...)` call), deliberately bypassing the
+        /// biometric `unlock()` since the password already authorizes this dose. On a wrong password we
+        /// surface an error (and the lockout message once the threshold is hit) and do NOT bolus. This
+        /// only ever runs when a password is set, so it cannot affect the no-password flow.
+        func confirmBolusWithPassword() async {
+            let entered = await MainActor.run { () -> String in
+                let value = self.bolusPasswordEntry
+                self.bolusPasswordEntry = ""
+                return value
+            }
+
+            // Silently ignore an empty submission (e.g. a stray double-tap after the field was
+            // already consumed) so it never counts as a failed attempt or trips the lockout.
+            guard !entered.isEmpty else { return }
+
+            guard bolusPasswordManager.verifyBolusPassword(entered) else {
+                if bolusPasswordManager.isLockedOut {
+                    await showLockoutAlert()
+                } else {
+                    await MainActor.run {
+                        self.bolusPasswordError = String(localized: "Incorrect password. Please try again.")
+                    }
+                }
+                return
+            }
+
+            let maxAmount = await MainActor.run { () -> Double in
+                self.showBolusPasswordPrompt = false
+                self.bolusPasswordError = ""
+                let resolvedAmount = min(self.pendingBolusAmount, self.maxBolus)
+                self.pendingBolusAmount = 0
+                self.isAwaitingDeterminationResult = true
+                return Double(resolvedAmount)
+            }
+
+            await apsManager.enactBolus(amount: maxAmount, isSMB: false, callback: nil)
+        }
+
+        /// Called when the user cancels the bolus-password prompt. Aborts without bolusing.
+        func cancelBolusPassword() {
+            Task { @MainActor in
+                self.showBolusPasswordPrompt = false
+                self.bolusPasswordEntry = ""
+                self.bolusPasswordError = ""
+                self.pendingBolusAmount = 0
+                self.addButtonPressed = false
+            }
+        }
+
+        /// Shared lockout alert, used by both the gate entry and the confirm path so the two
+        /// can't drift. Dismisses the prompt and surfaces the remaining cooldown.
+        @MainActor private func showLockoutAlert() {
+            let minutes = Int(ceil(bolusPasswordManager.lockoutRemaining / 60))
+            showBolusPasswordPrompt = false
+            isAwaitingDeterminationResult = false
+            showDeterminationFailureAlert = true
+            determinationFailureMessage = String(
+                localized: "Too many incorrect password attempts. Try again in \(minutes) min."
+            )
         }
 
         // MARK: - EXTERNAL INSULIN

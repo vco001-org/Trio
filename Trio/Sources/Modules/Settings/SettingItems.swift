@@ -262,6 +262,12 @@ enum SettingItems {
             path: ["Features", "Remote Control"]
         ),
         SettingItem(
+            title: "Security",
+            view: .security,
+            searchContents: ["Bolus Password"],
+            path: ["Features", "Security"]
+        ),
+        SettingItem(
             title: "User Interface",
             view: .userInterfaceSettings,
             searchContents: [
